@@ -41,13 +41,16 @@ jobs:
           if (-not (Test-Path "$vulkanSdk\Bin\glslc.exe")) { throw "Vulkan SDK installation is incomplete: $vulkanSdk" }
           "VULKAN_SDK=$vulkanSdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "$vulkanSdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Create short build path
+        shell: pwsh
+        run: New-Item -ItemType Junction -Path C:\k -Target $env:GITHUB_WORKSPACE
       - name: Build MSVC Vulkan runtime
         shell: bash
-        run: ./gradlew generateLlamaRuntimeManifest -Pllama.backend=VULKAN --stacktrace
+        run: cd /c/k && ./gradlew generateLlamaRuntimeManifest -Pllama.backend=VULKAN --stacktrace
       - name: Verify package and executable dependencies
         shell: pwsh
         run: |
-          $server = Get-ChildItem build/llama-runtime -Recurse -Filter llama-server.exe | Select-Object -First 1 -ExpandProperty FullName
+          $server = Get-ChildItem C:\k\build\llama-runtime -Recurse -Filter llama-server.exe | Select-Object -First 1 -ExpandProperty FullName
           if (-not $server) { throw "llama-server.exe was not staged" }
           & $server --version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
