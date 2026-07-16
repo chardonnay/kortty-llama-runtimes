@@ -280,6 +280,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       SIGNING_KEY: ${{ secrets.LLAMA_RUNTIME_ED25519_PRIVATE_KEY_PEM }}
+      EXPECTED_PUBLIC_KEY: ${{ vars.LLAMA_RUNTIME_ED25519_PUBLIC_KEY_PEM }}
       PROMOTION_REASON: ${{ inputs.promotion_reason }}
       REVOKED_RUNTIME_IDS: ${{ inputs.revoked_runtime_ids }}
       SOURCE_COMMIT: ${{ inputs.source_commit }}
@@ -323,6 +324,7 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$SIGNING_KEY"
+          test -n "$EXPECTED_PUBLIC_KEY"
           descriptors=(runtime-assets/*.json)
           packages=(runtime-assets/*.zip)
           test "${#descriptors[@]}" = 10
@@ -347,6 +349,12 @@ jobs:
             >runtime-assets/previous/runtime-index-v1.json
           printf '%s' "$SIGNING_KEY" >runtime-assets/signing-key.pem
           chmod 600 runtime-assets/signing-key.pem
+          printf '%s\n' "$EXPECTED_PUBLIC_KEY" >runtime-assets/expected-signing-public-key.pem
+          openssl pkey -in runtime-assets/signing-key.pem -pubout \
+            >runtime-assets/actual-signing-public-key.pem
+          cmp -s runtime-assets/expected-signing-public-key.pem \
+            runtime-assets/actual-signing-public-key.pem \
+            || { echo "The signing secret does not match the pinned public verification key."; exit 1; }
           if latest_tag="$(gh release view --json tagName --jq .tagName 2>/dev/null)" && [ -n "$latest_tag" ]; then
             gh release download "$latest_tag" \
               --pattern runtime-index-v1.json --pattern runtime-index-v1.sig \
@@ -389,6 +397,7 @@ jobs:
             -in runtime-assets/runtime-index-v1.json -out runtime-assets/runtime-index-v1.sig.raw
           base64 -w0 runtime-assets/runtime-index-v1.sig.raw >runtime-assets/runtime-index-v1.sig
           rm -rf runtime-assets/signing-key.pem runtime-assets/runtime-index-v1.sig.raw \
+            runtime-assets/expected-signing-public-key.pem runtime-assets/actual-signing-public-key.pem \
             runtime-assets/previous runtime-assets/requested-revocations.txt \
             runtime-assets/requested-revocations.json runtime-assets/new-packages.json \
             runtime-assets/all-packages.json
