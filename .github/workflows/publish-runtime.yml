@@ -420,4 +420,5 @@ jobs:
           gh release create "$RUNTIME_ID" runtime-assets/*.zip \
             runtime-assets/runtime-index-v1.json runtime-assets/runtime-index-v1.sig \
             --title "$RUNTIME_ID" \
+            --target "$SOURCE_COMMIT" \
             --notes "Human-promoted stable korTTY llama.cpp runtime matrix built from korTTY commit ${SOURCE_COMMIT}. Promotion reason: ${PROMOTION_REASON}. ${PROMOTION_AUDIT_NOTE}"
