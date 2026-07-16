@@ -330,7 +330,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          latest_created="$(gh release view --json createdAt --jq .createdAt 2>/dev/null || true)"
+          latest_created="$(gh release view --repo "$GITHUB_REPOSITORY" --json createdAt --jq .createdAt 2>/dev/null || true)"
           if [ -z "$latest_created" ]; then
             test "$PROMOTION_REASON" = initial \
               || { echo "The first release must use promotion reason 'initial'."; exit 1; }
