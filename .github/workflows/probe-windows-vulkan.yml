@@ -48,6 +48,7 @@ jobs:
           New-Item -ItemType Directory -Path C:\k | Out-Null
           robocopy $env:GITHUB_WORKSPACE C:\k /E /XD .git
           if ($LASTEXITCODE -gt 7) { throw "robocopy failed with exit code $LASTEXITCODE" }
+          $global:LASTEXITCODE = 0
       - name: Build MSVC Vulkan runtime
         shell: bash
         run: cd /c/k && ./gradlew generateLlamaRuntimeManifest -Pllama.backend=VULKAN --stacktrace
