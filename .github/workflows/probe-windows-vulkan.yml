@@ -1,0 +1,54 @@
+name: Probe Windows Vulkan runtime
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: "Reviewed full commit SHA from chardonnay/korTTY"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  windows-vulkan:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout reviewed korTTY source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: chardonnay/korTTY
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+      - name: Verify source identity
+        shell: bash
+        run: test "$(git rev-parse HEAD)" = "${{ inputs.source_commit }}"
+      - name: Set up JDK 25
+        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
+        with:
+          distribution: temurin
+          java-version: "25"
+      - name: Install Vulkan SDK
+        shell: pwsh
+        run: |
+          choco install cmake ninja vulkan-sdk -y --no-progress
+          $vulkanSdk = [Environment]::GetEnvironmentVariable("VULKAN_SDK", "Machine")
+          if ([string]::IsNullOrWhiteSpace($vulkanSdk)) {
+            $vulkanSdk = Get-ChildItem 'C:\VulkanSDK' -Directory | Sort-Object Name | Select-Object -Last 1 -ExpandProperty FullName
+          }
+          if (-not (Test-Path "$vulkanSdk\Bin\glslc.exe")) { throw "Vulkan SDK installation is incomplete: $vulkanSdk" }
+          "VULKAN_SDK=$vulkanSdk" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$vulkanSdk\Bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Build MSVC Vulkan runtime
+        shell: bash
+        run: ./gradlew generateLlamaRuntimeManifest -Pllama.backend=VULKAN --stacktrace
+      - name: Verify package and executable dependencies
+        shell: pwsh
+        run: |
+          $server = Get-ChildItem build/llama-runtime -Recurse -Filter llama-server.exe | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $server) { throw "llama-server.exe was not staged" }
+          & $server --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem (Split-Path $server) | Select-Object Name,Length
