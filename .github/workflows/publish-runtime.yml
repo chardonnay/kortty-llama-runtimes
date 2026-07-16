@@ -333,8 +333,8 @@ jobs:
           test -n "$EXPECTED_PUBLIC_KEY"
           descriptors=(runtime-assets/*.json)
           packages=(runtime-assets/*.zip)
-          test "${#descriptors[@]}" = 10
-          test "${#packages[@]}" = 10
+          test "${#descriptors[@]}" = 9
+          test "${#packages[@]}" = 9
           runtime_id="$(jq -r '.runtimeId' "${descriptors[@]}" | sort -u)"
           test "$(printf '%s\n' "$runtime_id" | wc -l)" = 1
           release_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${runtime_id}"
