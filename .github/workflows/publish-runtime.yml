@@ -421,5 +421,5 @@ jobs:
             runtime-assets/runtime-index-v1.json runtime-assets/runtime-index-v1.sig \
             --repo "$GITHUB_REPOSITORY" \
             --title "$RUNTIME_ID" \
-            --target "$SOURCE_COMMIT" \
+            --target main \
             --notes "Human-promoted stable korTTY llama.cpp runtime matrix built from korTTY commit ${SOURCE_COMMIT}. Promotion reason: ${PROMOTION_REASON}. ${PROMOTION_AUDIT_NOTE}"
