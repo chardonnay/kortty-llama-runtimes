@@ -393,7 +393,7 @@ jobs:
           latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
             --jq '[.[] | select(.tag_name | startswith("llama-"))] | sort_by(.created_at) | last | .tag_name // empty')"
           if [ -n "$latest_tag" ]; then
-            gh release download "$latest_tag" \
+            gh release download "$latest_tag" --repo "$GITHUB_REPOSITORY" \
               --pattern runtime-index-v1.json --pattern runtime-index-v1.sig \
               --dir runtime-assets/previous --clobber
             base64 --decode runtime-assets/previous/runtime-index-v1.sig \
