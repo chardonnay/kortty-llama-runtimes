@@ -330,7 +330,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          latest_created="$(gh release view --repo "$GITHUB_REPOSITORY" --json createdAt --jq .createdAt 2>/dev/null || true)"
+          latest_created="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '[.[] | select(.tag_name | startswith("llama-"))] | sort_by(.created_at) | last | .created_at // empty')"
           if [ -z "$latest_created" ]; then
             test "$PROMOTION_REASON" = initial \
               || { echo "The first release must use promotion reason 'initial'."; exit 1; }
@@ -389,7 +390,9 @@ jobs:
           cmp -s runtime-assets/expected-signing-public-key.pem \
             runtime-assets/actual-signing-public-key.pem \
             || { echo "The signing secret does not match the pinned public verification key."; exit 1; }
-          if latest_tag="$(gh release view --json tagName --jq .tagName 2>/dev/null)" && [ -n "$latest_tag" ]; then
+          latest_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '[.[] | select(.tag_name | startswith("llama-"))] | sort_by(.created_at) | last | .tag_name // empty')"
+          if [ -n "$latest_tag" ]; then
             gh release download "$latest_tag" \
               --pattern runtime-index-v1.json --pattern runtime-index-v1.sig \
               --dir runtime-assets/previous --clobber

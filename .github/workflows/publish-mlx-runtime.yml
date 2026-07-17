@@ -413,9 +413,12 @@ jobs:
             echo "Stable MLX runtime $RUNTIME_ID already exists and will not be overwritten."
             exit 1
           fi
+          # Never mark MLX releases as "latest": korTTY resolves the llama.cpp index through
+          # releases/latest/download, which must keep pointing at the newest llama release.
           gh release create "$RUNTIME_ID" runtime-assets/*.tar.zst runtime-assets/*.requirements.lock \
             runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
             --repo "$GITHUB_REPOSITORY" \
             --title "$RUNTIME_ID" \
+            --latest=false \
             --target main \
             --notes "Human-promoted stable korTTY MLX runtime (pinned relocatable CPython + hash-locked mlx-lm wheelhouse + authenticated korTTY launcher) built from korTTY commit ${SOURCE_COMMIT}. Promotion reason: ${PROMOTION_REASON}. ${PROMOTION_AUDIT_NOTE}"
