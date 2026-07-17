@@ -423,3 +423,23 @@ jobs:
             --latest=false \
             --target main \
             --notes "Human-promoted stable korTTY MLX runtime (pinned relocatable CPython + hash-locked mlx-lm wheelhouse + authenticated korTTY launcher) built from korTTY commit ${SOURCE_COMMIT}. Promotion reason: ${PROMOTION_REASON}. ${PROMOTION_AUDIT_NOTE}"
+
+      - name: Update the rolling mlx-stable index pointer
+        shell: bash
+        run: |
+          set -euo pipefail
+          # korTTY fetches the MLX index from the fixed mlx-stable tag, mirroring how the llama
+          # channel uses releases/latest. The tag is a mutable pointer; the Ed25519 signature on
+          # the index protects its integrity, exactly like the llama latest pointer.
+          if ! gh release view mlx-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create mlx-stable \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "mlx-stable (rolling signed index)" \
+              --latest=false \
+              --prerelease \
+              --target main \
+              --notes "Rolling pointer to the newest signed MLX runtime index. Assets are replaced by every stable MLX promotion; the detached Ed25519 signature protects the index bytes."
+          fi
+          gh release upload mlx-stable \
+            runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
+            --repo "$GITHUB_REPOSITORY" --clobber
