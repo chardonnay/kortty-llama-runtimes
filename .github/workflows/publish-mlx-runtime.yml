@@ -230,9 +230,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p build/mlx-runtime/dist
-          tar -C build/mlx-runtime/packages -cf - "$INSTALL_ID" \
-            | zstd -19 -T0 -o "build/mlx-runtime/dist/$INSTALL_ID.tar.zst"
-          archive="build/mlx-runtime/dist/$INSTALL_ID.tar.zst"
+          # zip WITHOUT -y deliberately follows symlinks: korTTY extracts runtime packages
+          # with java.util.zip, which cannot restore symbolic links.
+          (cd build/mlx-runtime/packages && zip -qr "../dist/$INSTALL_ID.zip" "$INSTALL_ID")
+          archive="build/mlx-runtime/dist/$INSTALL_ID.zip"
           sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
           size_bytes="$(stat -f %z "$archive")"
           lock_sha256="$(shasum -a 256 mlx-runtime/requirements.lock | awk '{print $1}')"
@@ -245,7 +246,7 @@ jobs:
             --arg sha256 "$sha256" \
             --arg lockSha256 "$lock_sha256" \
             --argjson sizeBytes "$size_bytes" \
-            --arg downloadUrl "local://$INSTALL_ID.tar.zst" \
+            --arg downloadUrl "local://$INSTALL_ID.zip" \
             '{schemaVersion: 1,
               runtimeId: $runtimeId,
               installationId: $installationId,
@@ -329,7 +330,7 @@ jobs:
           test -n "$SIGNING_KEY"
           test -n "$EXPECTED_PUBLIC_KEY"
           descriptors=(runtime-assets/*.json)
-          packages=(runtime-assets/*.tar.zst)
+          packages=(runtime-assets/*.zip)
           test "${#descriptors[@]}" = 1
           test "${#packages[@]}" = 1
           descriptor="${descriptors[0]}"
@@ -415,7 +416,7 @@ jobs:
           fi
           # Never mark MLX releases as "latest": korTTY resolves the llama.cpp index through
           # releases/latest/download, which must keep pointing at the newest llama release.
-          gh release create "$RUNTIME_ID" runtime-assets/*.tar.zst runtime-assets/*.requirements.lock \
+          gh release create "$RUNTIME_ID" runtime-assets/*.zip runtime-assets/*.requirements.lock \
             runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
             --repo "$GITHUB_REPOSITORY" \
             --title "$RUNTIME_ID" \
