@@ -1,0 +1,421 @@
+name: Build and publish signed MLX runtime
+
+# The MLX channel mirrors the llama.cpp channel: candidates are built from a reviewed
+# chardonnay/korTTY commit, and the cumulative mlx-runtime-index-v1 is signed with the same
+# Ed25519 release key inside the protected signing environment. MLX packages exist only for
+# Apple-Silicon macOS (14+): one pinned relocatable CPython plus the hash-locked mlx-lm
+# wheelhouse and korTTY's authenticated launcher.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_commit:
+        description: "Reviewed full commit SHA from chardonnay/korTTY (must contain the reviewed mlx-runtime/requirements.lock)"
+        required: true
+        type: string
+      promotion_reason:
+        description: "Reason for stable promotion"
+        required: true
+        type: choice
+        options: [initial, regular, security, model-support]
+        default: regular
+      revoked_runtime_ids:
+        description: "Optional comma/newline-separated MLX runtime or installation IDs to revoke"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-kortty-mlx-runtime
+  cancel-in-progress: false
+
+jobs:
+  validate-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require an immutable source commit
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$SOURCE_COMMIT" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "source_commit must be a full lowercase Git commit SHA."
+            exit 1
+          fi
+      - name: Verify that the commit exists in the canonical repository
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          resolved="$(gh api "repos/chardonnay/korTTY/commits/$SOURCE_COMMIT" --jq .sha)"
+          test "$resolved" = "$SOURCE_COMMIT" \
+            || { echo "The requested commit does not exist in chardonnay/korTTY."; exit 1; }
+
+  build-mlx-runtime:
+    needs: validate-source
+    # MLX only exists on Apple silicon; macos-latest is an arm64 (macOS 14+) runner.
+    runs-on: macos-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout reviewed korTTY source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: chardonnay/korTTY
+          ref: ${{ inputs.source_commit }}
+          persist-credentials: false
+
+      - name: Verify checked-out source identity
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
+
+      - name: Install build tools
+        shell: bash
+        run: brew install jq zstd uv
+
+      - name: Adopt the pinned build constants from the reviewed source
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The reviewed korTTY commit is the single source of truth for every pin; re-declaring
+          # them here would let the channel silently drift from what korTTY validated.
+          workflow=.github/workflows/mlx-runtime.yml
+          pin() {
+            local key="$1"
+            local value
+            value="$(grep -m1 -E "^  ${key}: " "$workflow" | sed -E 's/^[^:]+: *"?([^"]*)"?$/\1/')"
+            test -n "$value" || { echo "Pinned constant ${key} missing in ${workflow}."; exit 1; }
+            echo "${key}=${value}" >> "$GITHUB_ENV"
+          }
+          pin MLX_LM_VERSION
+          pin MLX_RUNTIME_REVISION
+          pin PYTHON_STANDALONE_URL
+          pin PYTHON_STANDALONE_SHA256
+          pin PYTHON_STANDALONE_VERSION
+          pin MACOSX_DEPLOYMENT_TARGET
+
+      - name: Resolve immutable runtime and installation ids
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "RUNTIME_ID=mlx-${MLX_LM_VERSION}-${MLX_RUNTIME_REVISION}" >> "$GITHUB_ENV"
+          echo "INSTALL_ID=mlx-${MLX_LM_VERSION}-${MLX_RUNTIME_REVISION}-macos-aarch64" >> "$GITHUB_ENV"
+
+      - name: Require the reviewed dependency lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Stable promotion is only valid for a commit whose hash lock a human has reviewed and
+          # committed; a bootstrap-generated lock never leaves the candidate workflow.
+          test -f mlx-runtime/requirements.lock \
+            || { echo "mlx-runtime/requirements.lock is not committed at this source commit."; exit 1; }
+          grep -q "^mlx-lm==${MLX_LM_VERSION} " mlx-runtime/requirements.lock \
+            || grep -q "^mlx-lm==${MLX_LM_VERSION}$" mlx-runtime/requirements.lock \
+            || grep -q "^mlx-lm==${MLX_LM_VERSION} \\\\" mlx-runtime/requirements.lock \
+            || { echo "The committed lock does not pin mlx-lm ${MLX_LM_VERSION}."; exit 1; }
+
+      - name: Download and verify pinned relocatable CPython
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "build/mlx-runtime/packages/$INSTALL_ID"
+          curl --fail --location --retry 3 "$PYTHON_STANDALONE_URL" -o build/mlx-runtime/python.tar.gz
+          echo "$PYTHON_STANDALONE_SHA256  build/mlx-runtime/python.tar.gz" | shasum -a 256 -c -
+          tar -xzf build/mlx-runtime/python.tar.gz -C "build/mlx-runtime/packages/$INSTALL_ID"
+          test -x "build/mlx-runtime/packages/$INSTALL_ID/python/bin/python3"
+
+      - name: Install hash-locked wheelhouse into the relocatable CPython
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv pip install \
+            --python "build/mlx-runtime/packages/$INSTALL_ID/python/bin/python3" \
+            --require-hashes \
+            --no-build \
+            -r mlx-runtime/requirements.lock
+          "build/mlx-runtime/packages/$INSTALL_ID/python/bin/python3" - <<PY
+          import mlx_lm
+          import os
+          expected = os.environ["MLX_LM_VERSION"]
+          actual = getattr(mlx_lm, "__version__", "unknown")
+          if actual != expected:
+              raise SystemExit(f"pinned mlx-lm {expected} expected but {actual} was installed")
+          print(f"staged mlx-lm {actual}")
+          PY
+
+      - name: Stage authenticated launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp src/main/resources/mlx/kortty_mlx_server.py "build/mlx-runtime/packages/$INSTALL_ID/kortty_mlx_server.py"
+          "build/mlx-runtime/packages/$INSTALL_ID/python/bin/python3" -m py_compile \
+            "build/mlx-runtime/packages/$INSTALL_ID/kortty_mlx_server.py"
+
+      - name: Full authenticated API contract smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3_bin="build/mlx-runtime/packages/$INSTALL_ID/python/bin/python3"
+          launcher="build/mlx-runtime/packages/$INSTALL_ID/kortty_mlx_server.py"
+          model_dir=build/mlx-runtime/smoke-model
+          # The smoke model is pinned to an immutable revision; a mutable head must not be able
+          # to change what a stable promotion validated.
+          "$python3_bin" - <<PY
+          from huggingface_hub import snapshot_download
+          snapshot_download(
+              "mlx-community/Qwen3-0.6B-4bit",
+              revision="73e3e38d981303bc594367cd910ea6eb48349da8",
+              local_dir="$model_dir")
+          PY
+          key="$("$python3_bin" -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          umask 177
+          printf '%s\n' "$key" > build/mlx-runtime/smoke-api-key
+          umask 022
+          cleanup() {
+            for pid in $(jobs -p); do
+              kill "$pid" >/dev/null 2>&1 || true
+            done
+          }
+          trap cleanup EXIT
+
+          "$python3_bin" "$launcher" \
+            --model "$model_dir" \
+            --host 127.0.0.1 \
+            --port 18090 \
+            --api-key-file build/mlx-runtime/smoke-api-key \
+            --max-idle-seconds 20 \
+            >build/mlx-runtime/server-smoke.log 2>&1 &
+          server_pid=$!
+          for _ in $(seq 1 120); do
+            curl --silent --fail http://127.0.0.1:18090/health >/dev/null && break
+            sleep 1
+          done
+          grep -q "KORTTY-MLX-READY 18090" build/mlx-runtime/server-smoke.log
+          curl --fail --silent http://127.0.0.1:18090/health | jq -e '.status == "ok"'
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header 'Content-Type: application/json' \
+            --data '{"messages":[{"role":"user","content":"blocked"}],"max_tokens":1}' \
+            http://127.0.0.1:18090/v1/chat/completions)" = 401
+          test "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+            --header 'Authorization: Bearer wrong-key-0000000000' \
+            --header 'Content-Type: application/json' \
+            --data '{"messages":[{"role":"user","content":"blocked"}],"max_tokens":1}' \
+            http://127.0.0.1:18090/v1/chat/completions)" = 401
+          curl --fail --max-time 600 --header "Authorization: Bearer $key" \
+            --header 'Content-Type: application/json' \
+            --data '{"messages":[{"role":"user","content":"Reply with one word."}],"max_tokens":16}' \
+            http://127.0.0.1:18090/v1/chat/completions | jq -e '.choices | length == 1'
+          for _ in $(seq 1 120); do
+            kill -0 "$server_pid" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$server_pid" 2>/dev/null; then
+            echo "MLX sidecar did not self-exit after its idle window."
+            exit 1
+          fi
+          wait "$server_pid"
+          grep -q "idle for" build/mlx-runtime/server-smoke.log
+
+      - name: Package immutable archive and descriptor
+        shell: bash
+        env:
+          SOURCE_COMMIT: ${{ inputs.source_commit }}
+        run: |
+          set -euo pipefail
+          mkdir -p build/mlx-runtime/dist
+          tar -C build/mlx-runtime/packages -cf - "$INSTALL_ID" \
+            | zstd -19 -T0 -o "build/mlx-runtime/dist/$INSTALL_ID.tar.zst"
+          archive="build/mlx-runtime/dist/$INSTALL_ID.tar.zst"
+          sha256="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          size_bytes="$(stat -f %z "$archive")"
+          lock_sha256="$(shasum -a 256 mlx-runtime/requirements.lock | awk '{print $1}')"
+          jq -n \
+            --arg runtimeId "$RUNTIME_ID" \
+            --arg installationId "$INSTALL_ID" \
+            --arg mlxLmVersion "$MLX_LM_VERSION" \
+            --arg pythonVersion "$PYTHON_STANDALONE_VERSION" \
+            --arg sourceCommit "$SOURCE_COMMIT" \
+            --arg sha256 "$sha256" \
+            --arg lockSha256 "$lock_sha256" \
+            --argjson sizeBytes "$size_bytes" \
+            --arg downloadUrl "local://$INSTALL_ID.tar.zst" \
+            '{schemaVersion: 1,
+              runtimeId: $runtimeId,
+              installationId: $installationId,
+              platform: "macos",
+              architecture: "aarch64",
+              backend: "MLX",
+              minimumOsVersion: "14.0",
+              mlxLmVersion: $mlxLmVersion,
+              pythonVersion: $pythonVersion,
+              sourceCommit: $sourceCommit,
+              executablePath: "python/bin/python3",
+              launcherPath: "kortty_mlx_server.py",
+              sizeBytes: $sizeBytes,
+              sha256: $sha256,
+              requirementsLockSha256: $lockSha256,
+              downloadUrl: $downloadUrl}' \
+            >"build/mlx-runtime/dist/$INSTALL_ID.json"
+          cp mlx-runtime/requirements.lock "build/mlx-runtime/dist/$INSTALL_ID.requirements.lock"
+          ls -la build/mlx-runtime/dist
+
+      - name: Upload reviewed package candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mlx-runtime-macos-aarch64
+          path: build/mlx-runtime/dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-mlx-stable:
+    needs: build-mlx-runtime
+    runs-on: ubuntu-latest
+    environment: llama-runtime-signing
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SIGNING_KEY: ${{ secrets.LLAMA_RUNTIME_ED25519_PRIVATE_KEY_PEM }}
+      EXPECTED_PUBLIC_KEY: ${{ vars.LLAMA_RUNTIME_ED25519_PUBLIC_KEY_PEM }}
+      PROMOTION_REASON: ${{ inputs.promotion_reason }}
+      REVOKED_RUNTIME_IDS: ${{ inputs.revoked_runtime_ids }}
+      SOURCE_COMMIT: ${{ inputs.source_commit }}
+    steps:
+      - name: Download reviewed runtime package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: mlx-runtime-macos-aarch64
+          path: runtime-assets
+
+      - name: Enforce stable cadence for the MLX channel
+        shell: bash
+        run: |
+          set -euo pipefail
+          latest_created="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '[.[] | select(.tag_name | startswith("mlx-"))] | sort_by(.created_at) | last | .created_at // empty')"
+          if [ -z "$latest_created" ]; then
+            test "$PROMOTION_REASON" = initial \
+              || { echo "The first MLX release must use promotion reason 'initial'."; exit 1; }
+            audit_note="Initial human-dispatched stable MLX promotion."
+          else
+            test "$PROMOTION_REASON" != initial \
+              || { echo "'initial' is valid only when no stable MLX release exists."; exit 1; }
+            latest_epoch="$(date -u -d "$latest_created" +%s)"
+            now_epoch="$(date -u +%s)"
+            age_seconds="$((now_epoch - latest_epoch))"
+            if [ "$PROMOTION_REASON" = regular ] && [ "$age_seconds" -lt 604800 ]; then
+              echo "Regular promotion denied: the latest stable MLX release is under seven days old."
+              exit 1
+            fi
+            if [ "$PROMOTION_REASON" = regular ]; then
+              audit_note="Regular seven-day stable cadence gate satisfied."
+            else
+              audit_note="Human-dispatched cadence override: ${PROMOTION_REASON}."
+            fi
+          fi
+          echo "PROMOTION_AUDIT_NOTE=$audit_note" >> "$GITHUB_ENV"
+
+      - name: Verify package and build signed cumulative MLX index
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$SIGNING_KEY"
+          test -n "$EXPECTED_PUBLIC_KEY"
+          descriptors=(runtime-assets/*.json)
+          packages=(runtime-assets/*.tar.zst)
+          test "${#descriptors[@]}" = 1
+          test "${#packages[@]}" = 1
+          descriptor="${descriptors[0]}"
+          archive="${packages[0]}"
+          runtime_id="$(jq -r '.runtimeId' "$descriptor")"
+          test -n "$runtime_id"
+          expected="$(jq -r .sha256 "$descriptor")"
+          actual="$(sha256sum "$archive" | awk '{print $1}')"
+          test "$actual" = "$expected"
+          release_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${runtime_id}"
+          jq --arg url "$release_url/$(basename "$archive")" '.downloadUrl = $url' \
+            "$descriptor" >"$descriptor.tmp"
+          mv "$descriptor.tmp" "$descriptor"
+
+          mkdir -p runtime-assets/previous
+          printf '%s' '{"schemaVersion":1,"generatedAt":"1970-01-01T00:00:00Z","revokedRuntimeIds":[],"packages":[]}' \
+            >runtime-assets/previous/mlx-runtime-index-v1.json
+          printf '%s' "$SIGNING_KEY" >runtime-assets/signing-key.pem
+          chmod 600 runtime-assets/signing-key.pem
+          printf '%s\n' "$EXPECTED_PUBLIC_KEY" >runtime-assets/expected-signing-public-key.pem
+          openssl pkey -in runtime-assets/signing-key.pem -pubout \
+            >runtime-assets/actual-signing-public-key.pem
+          cmp -s runtime-assets/expected-signing-public-key.pem \
+            runtime-assets/actual-signing-public-key.pem \
+            || { echo "The signing secret does not match the pinned public verification key."; exit 1; }
+          latest_mlx_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '[.[] | select(.tag_name | startswith("mlx-"))] | sort_by(.created_at) | last | .tag_name // empty')"
+          if [ -n "$latest_mlx_tag" ]; then
+            gh release download "$latest_mlx_tag" \
+              --pattern mlx-runtime-index-v1.json --pattern mlx-runtime-index-v1.sig \
+              --dir runtime-assets/previous --clobber
+            base64 --decode runtime-assets/previous/mlx-runtime-index-v1.sig \
+              >runtime-assets/previous/mlx-runtime-index-v1.sig.raw
+            openssl pkey -in runtime-assets/signing-key.pem -pubout \
+              >runtime-assets/previous/signing-public-key.pem
+            openssl pkeyutl -verify -pubin \
+              -inkey runtime-assets/previous/signing-public-key.pem -rawin \
+              -in runtime-assets/previous/mlx-runtime-index-v1.json \
+              -sigfile runtime-assets/previous/mlx-runtime-index-v1.sig.raw
+          fi
+
+          printf '%s' "$REVOKED_RUNTIME_IDS" | tr ',\r' '\n\n' \
+            | sed -E 's/^[[:space:]]+|[[:space:]]+$//g' | sed '/^$/d' | sort -u \
+            >runtime-assets/requested-revocations.txt
+          if grep -Ev '^[A-Za-z0-9._-]+$' runtime-assets/requested-revocations.txt; then
+            echo "Revoked runtime IDs contain invalid characters."
+            exit 1
+          fi
+          jq -R -s 'split("\n") | map(select(length > 0))' \
+            runtime-assets/requested-revocations.txt >runtime-assets/requested-revocations.json
+          jq -s '.' "$descriptor" >runtime-assets/new-packages.json
+          jq -s '((.[0].packages // []) + .[1])' \
+            runtime-assets/previous/mlx-runtime-index-v1.json runtime-assets/new-packages.json \
+            >runtime-assets/all-packages.json
+          jq -e 'group_by(.runtimeId + "|" + .platform + "|" + .architecture + "|" + .backend)
+            | all(.[]; (map(.sha256) | unique | length) == 1)' runtime-assets/all-packages.json >/dev/null
+          jq -n \
+            --slurpfile previous runtime-assets/previous/mlx-runtime-index-v1.json \
+            --slurpfile packages runtime-assets/all-packages.json \
+            --slurpfile requested runtime-assets/requested-revocations.json \
+            '{schemaVersion: 1,
+              generatedAt: (now | todateiso8601),
+              revokedRuntimeIds: (((($previous[0].revokedRuntimeIds // []) + $requested[0]) | unique | sort)),
+              packages: (($packages[0] | unique_by(.runtimeId + "|" + .platform + "|" + .architecture + "|" + .backend) | sort_by(.runtimeId, .platform, .architecture, .backend)))}' \
+            >runtime-assets/mlx-runtime-index-v1.json
+          openssl pkeyutl -sign -rawin -inkey runtime-assets/signing-key.pem \
+            -in runtime-assets/mlx-runtime-index-v1.json -out runtime-assets/mlx-runtime-index-v1.sig.raw
+          base64 -w0 runtime-assets/mlx-runtime-index-v1.sig.raw >runtime-assets/mlx-runtime-index-v1.sig
+          rm -rf runtime-assets/signing-key.pem runtime-assets/mlx-runtime-index-v1.sig.raw \
+            runtime-assets/expected-signing-public-key.pem runtime-assets/actual-signing-public-key.pem \
+            runtime-assets/previous runtime-assets/requested-revocations.txt \
+            runtime-assets/requested-revocations.json runtime-assets/new-packages.json \
+            runtime-assets/all-packages.json
+          echo "RUNTIME_ID=$runtime_id" >> "$GITHUB_ENV"
+
+      - name: Publish immutable stable MLX assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "$RUNTIME_ID" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Stable MLX runtime $RUNTIME_ID already exists and will not be overwritten."
+            exit 1
+          fi
+          gh release create "$RUNTIME_ID" runtime-assets/*.tar.zst runtime-assets/*.requirements.lock \
+            runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$RUNTIME_ID" \
+            --target main \
+            --notes "Human-promoted stable korTTY MLX runtime (pinned relocatable CPython + hash-locked mlx-lm wheelhouse + authenticated korTTY launcher) built from korTTY commit ${SOURCE_COMMIT}. Promotion reason: ${PROMOTION_REASON}. ${PROMOTION_AUDIT_NOTE}"
