@@ -278,6 +278,11 @@ jobs:
   publish-mlx-stable:
     needs: build-mlx-runtime
     runs-on: ubuntu-latest
+    # Serialised across BOTH publish workflows: each release carries the other channel's index, so two
+    # promotions racing would let the later one carry a stale copy.
+    concurrency:
+      group: publish-kortty-runtime-release
+      cancel-in-progress: false
     environment: llama-runtime-signing
     permissions:
       contents: write
@@ -300,7 +305,7 @@ jobs:
         run: |
           set -euo pipefail
           latest_created="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-            --jq '[.[] | select(.tag_name | startswith("mlx-"))] | sort_by(.created_at) | last | .created_at // empty')"
+            --jq '[.[] | select(.tag_name | test("^mlx-[0-9]"))] | sort_by(.created_at) | last | .created_at // empty')"
           if [ -z "$latest_created" ]; then
             test "$PROMOTION_REASON" = initial \
               || { echo "The first MLX release must use promotion reason 'initial'."; exit 1; }
@@ -357,7 +362,7 @@ jobs:
             runtime-assets/actual-signing-public-key.pem \
             || { echo "The signing secret does not match the pinned public verification key."; exit 1; }
           latest_mlx_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
-            --jq '[.[] | select(.tag_name | startswith("mlx-"))] | sort_by(.created_at) | last | .tag_name // empty')"
+            --jq '[.[] | select(.tag_name | test("^mlx-[0-9]"))] | sort_by(.created_at) | last | .tag_name // empty')"
           if [ -n "$latest_mlx_tag" ]; then
             gh release download "$latest_mlx_tag" --repo "$GITHUB_REPOSITORY" \
               --pattern mlx-runtime-index-v1.json --pattern mlx-runtime-index-v1.sig \
@@ -406,6 +411,33 @@ jobs:
             runtime-assets/all-packages.json
           echo "RUNTIME_ID=$runtime_id" >> "$GITHUB_ENV"
 
+      - name: Carry the current signed llama.cpp index forward
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Every promotion of either channel creates a new immutable release marked latest, and korTTY
+          # resolves BOTH indexes through releases/latest. The other channel's signed index is therefore
+          # copied byte-for-byte from its newest versioned release; its detached signature stays valid and
+          # is re-verified here so a corrupt carry fails before anything is published.
+          other_tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --paginate \
+            --jq '[.[] | select(.draft | not) | select(.tag_name | test("^llama-"))] | sort_by(.created_at) | last | .tag_name // empty')"
+          if [ -z "$other_tag" ]; then
+            echo "No llama.cpp release exists yet; nothing to carry."
+            exit 0
+          fi
+          mkdir -p runtime-assets/carried
+          gh release download "$other_tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern runtime-index-v1.json --pattern runtime-index-v1.sig \
+            --dir runtime-assets/carried --clobber
+          printf '%s\n' "$EXPECTED_PUBLIC_KEY" >runtime-assets/carried/public-key.pem
+          base64 --decode runtime-assets/carried/runtime-index-v1.sig >runtime-assets/carried/runtime-index-v1.sig.raw
+          openssl pkeyutl -verify -pubin -inkey runtime-assets/carried/public-key.pem -rawin \
+            -in runtime-assets/carried/runtime-index-v1.json \
+            -sigfile runtime-assets/carried/runtime-index-v1.sig.raw
+          mv runtime-assets/carried/runtime-index-v1.json runtime-assets/carried/runtime-index-v1.sig runtime-assets/
+          rm -rf runtime-assets/carried
+          echo "Carried the signed llama.cpp index from $other_tag."
+
       - name: Publish immutable stable MLX assets
         shell: bash
         run: |
@@ -414,32 +446,41 @@ jobs:
             echo "Stable MLX runtime $RUNTIME_ID already exists and will not be overwritten."
             exit 1
           fi
-          # Never mark MLX releases as "latest": korTTY resolves the llama.cpp index through
-          # releases/latest/download, which must keep pointing at the newest llama release.
+          carried=()
+          if [ -f runtime-assets/runtime-index-v1.json ]; then
+            carried=(runtime-assets/runtime-index-v1.json runtime-assets/runtime-index-v1.sig)
+          fi
+          # Marked latest like a llama.cpp promotion: the release carries the llama.cpp index too, so
+          # releases/latest keeps serving both channels. All assets are attached in the create call
+          # because an immutable release cannot gain assets once it is published.
           gh release create "$RUNTIME_ID" runtime-assets/*.zip runtime-assets/*.requirements.lock \
             runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
+            "${carried[@]}" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$RUNTIME_ID" \
-            --latest=false \
+            --latest \
             --target main \
             --notes "Human-promoted stable korTTY MLX runtime (pinned relocatable CPython + hash-locked mlx-lm wheelhouse + authenticated korTTY launcher) built from korTTY commit ${SOURCE_COMMIT}. Promotion reason: ${PROMOTION_REASON}. ${PROMOTION_AUDIT_NOTE}"
 
-      - name: Update the rolling mlx-stable index pointer
+      - name: Update the legacy mlx-stable index pointer
         shell: bash
         run: |
           set -euo pipefail
-          # korTTY fetches the MLX index from the fixed mlx-stable tag, mirroring how the llama
-          # channel uses releases/latest. The tag is a mutable pointer; the Ed25519 signature on
-          # the index protects its integrity, exactly like the llama latest pointer.
-          if ! gh release view mlx-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          # Legacy: korTTY builds before the combined layout fetch the MLX index from the fixed mlx-stable
+          # tag. It predates immutable releases and so stays mutable; the Ed25519 signature on the index
+          # protects its integrity. Should it ever be recreated it would be immutable, so a new pointer
+          # receives its assets in the create call and is never uploaded to afterwards.
+          if gh release view mlx-stable --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload mlx-stable \
+              runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
+              --repo "$GITHUB_REPOSITORY" --clobber
+          else
             gh release create mlx-stable \
+              runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
               --repo "$GITHUB_REPOSITORY" \
               --title "mlx-stable (rolling signed index)" \
               --latest=false \
               --prerelease \
               --target main \
-              --notes "Rolling pointer to the newest signed MLX runtime index. Assets are replaced by every stable MLX promotion; the detached Ed25519 signature protects the index bytes."
+              --notes "Legacy pointer to the newest signed MLX runtime index for older korTTY builds. Current builds read the index from the latest release."
           fi
-          gh release upload mlx-stable \
-            runtime-assets/mlx-runtime-index-v1.json runtime-assets/mlx-runtime-index-v1.sig \
-            --repo "$GITHUB_REPOSITORY" --clobber
