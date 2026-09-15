@@ -484,3 +484,72 @@ jobs:
               --target main \
               --notes "Legacy pointer to the newest signed MLX runtime index for older korTTY builds. Current builds read the index from the latest release."
           fi
+
+      - name: Verify releases/latest and the legacy pointer serve this release's signed indexes
+        shell: bash
+        run: |
+          set -uo pipefail
+          # korTTY reads its runtime indexes from releases/latest/download/<asset>. That pointer is
+          # repository-wide, so a release of the OTHER channel can take it and the app's fixed URL then
+          # answers 404 — silently, because nothing else in either repository fetches it. That is exactly
+          # how the llama.cpp channel stayed dark for weeks after an MLX release took the pointer. Every
+          # promotion now proves, against the real URLs, that the pointer moved here and serves
+          # byte-identical indexes for every channel this release carries — plus the legacy mlx-stable
+          # pointer, which is the only MLX address builds before the combined layout know. The release is
+          # already immutable at this point: a failure here does not undo it, it tells a human that
+          # installed builds are cut off and the pointer needs fixing.
+          base="https://github.com/${GITHUB_REPOSITORY}/releases"
+          required=(mlx-runtime-index-v1.json mlx-runtime-index-v1.sig)
+          if [ -f runtime-assets/runtime-index-v1.json ]; then
+            required+=(runtime-index-v1.json runtime-index-v1.sig)
+          else
+            echo "::warning::No llama.cpp index was carried into ${RUNTIME_ID}, so releases/latest serves the MLX channel only. Installed builds lose the llama.cpp runtime channel until a release carries its index again."
+          fi
+
+          mkdir -p smoke
+          attempt=1
+          while :; do
+            failed=0
+            # The pointer and the asset CDN need a moment to settle after an immutable release.
+            resolved="$(curl -sS -o /dev/null -w '%{url_effective}' -L "${base}/latest" 2>/dev/null || true)"
+            case "$resolved" in
+              */releases/tag/"$RUNTIME_ID") ;;
+              *) echo "releases/latest resolves to '${resolved:-<no response>}', not ${RUNTIME_ID}."; failed=1 ;;
+            esac
+            if [ "$failed" = 0 ]; then
+              for asset in "${required[@]}"; do
+                if ! curl -fsSL --max-time 60 -o "smoke/${asset}" "${base}/latest/download/${asset}" 2>/dev/null; then
+                  echo "${asset} is not served from releases/latest."
+                  failed=1
+                  continue
+                fi
+                if ! cmp -s "smoke/${asset}" "runtime-assets/${asset}"; then
+                  echo "${asset} served from releases/latest differs from the bytes just published."
+                  failed=1
+                fi
+              done
+              # Legacy pointer: every korTTY build up to the combined layout reads MLX from here only.
+              for asset in mlx-runtime-index-v1.json mlx-runtime-index-v1.sig; do
+                if ! curl -fsSL --max-time 60 -o "smoke/legacy-${asset}" "${base}/download/mlx-stable/${asset}" 2>/dev/null; then
+                  echo "${asset} is not served from the legacy mlx-stable pointer."
+                  failed=1
+                  continue
+                fi
+                if ! cmp -s "smoke/legacy-${asset}" "runtime-assets/${asset}"; then
+                  echo "${asset} served from mlx-stable differs from the bytes just published."
+                  failed=1
+                fi
+              done
+            fi
+            if [ "$failed" = 0 ]; then
+              break
+            fi
+            if [ "$attempt" -ge 6 ]; then
+              echo "::error::releases/latest or the legacy mlx-stable pointer does not serve this release's signed indexes. korTTY fetches these exact URLs at every application start, so the runtime update channel — and with it the revocation channel — is broken for every installed build. Check which release holds the latest pointer and whether it carries both signed indexes."
+              exit 1
+            fi
+            echo "Attempt ${attempt} failed; retrying in 10s."
+            attempt=$((attempt + 1))
+            sleep 10
+          done
+          echo "releases/latest resolves to ${RUNTIME_ID} and serves: ${required[*]} (plus the legacy mlx-stable pointer)"
